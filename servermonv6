@@ -2,7 +2,7 @@
 # collect monitoring output and write to timestamped files
 # run this script as the DB2 instance owner
 
-my $version = "1.14";
+
 my $filename = $0;
 
 print "**********************************************************************\n";
