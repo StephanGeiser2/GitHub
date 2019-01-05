@@ -1,0 +1,1174 @@
+#!/usr/bin/env perl
+# collect monitoring output and write to timestamped files
+# run this script as the DB2 instance owner
+
+my $version = "1.14";
+my $filename = $0;
+
+print "**********************************************************************\n";
+print "* (C) Copyright IBM Corporation 2014, 2014.  All rights reserved.    *\n";
+print "*                                                                    *\n";
+print "* Tivoli Storage Manager                                             *\n";
+print "*                                                                    *\n";
+print "* This script collects useful information to verify server           *\n";
+print "* operations as documented with technote swg21432937.                *\n";
+print "* See http://www-01.ibm.com/support/docview.wss?uid=swg21432937      *\n";
+print "* for the latest version of the script                               *\n";
+print "* You need to run the script as instance user with the DB2 env       *\n";
+print "* initialized. The script will prompt you for the necessary          *\n";
+print "* parameters required to run successfully.                           *\n";
+print "*                                                                    *\n";
+print "* Usage: " . $filename . " <noprompt>                                *\n";
+print "*                                                                    *\n";
+print "* Dependencies: UNIX or Windows                                      *\n";
+print "*               Perl interpreter installed                           *\n";
+print "*               TSM administrative client installed and configured   *\n";
+print "*               TSM server installed on the same box                 *\n";
+print "*                                                                    *\n";
+print "* " . $filename . " " . $version . "                                            *\n";
+print "*                                                                    *\n";
+print "**********************************************************************\n";
+
+# 150611 1.11 -c parameter added to lparstat
+# 150622 1.12 ignore ANS0102W, changes to lparstat
+# 150727 1.13 OS path delimiter correction
+# 150731 1.14 corrected perl module check, throw message is not found
+
+use POSIX("strftime");
+use Cwd;
+use List::Util      qw(max);
+
+use Carp;
+
+# Default values:
+my $server          = "s96tsm33";    # server stanza for UNIX, TCPSERVERADDRESS for MSWin32
+my $tcpport         = "1500";         # only used in MSWin32
+my $administrator   = "adm_script";        # the admin id
+my $password        = "56YHMk5YqBpX51bA4bRO";     # guess what?
+my $pmr             = "51867,070,724";         # if doc collection is for a PMR, fully specify the number PPPPP,BBB,CCC                                    
+my $showthreads     = "";             # include SHOW THREADS command output, valid Y/N
+my $showdedupdelete = "";             # include SHOW DEDUPDELETE command output, valid Y/N
+my $sqlstats        = "";             # enable collectstmt instrumentation, valid Y/N
+my $dynamicsql      = "";             # collect dynamic SQL output, valid Y/N
+my $traceflags      = "REPL REPLERROR";         # activate tracing while the script runs
+my $disableflags    = "none";         # disable traceflags if trace specified
+my $maxsize         = "-1";           # limit the size of the trace generated, MB (maximum 65535), -1 unlimited
+my $stopevent       = "none";         # comma separated list of actlog stop events, e.g. use ANR1331E
+my $diagCycles      = "-1";           # how many diag cycles to run, run endless if < 0
+
+my $instance        = "s96tsm33";     # DB2 instance name, if your DB2INSTANCE environment variable is set it
+                                      # will override this value
+my $dbalias         = "tsmdb1";       # DB2 database alias for TSM database
+
+                                      # Note: if you see the following error message in the db2 output files
+                                      # SQL10007N Message "-1390" could not be retrieved. Reason code: "3".
+                                      # make sure to adjust the $instance variable to match your environment
+
+# End of user settable parameters
+# typically you do not need to make any changes from here on
+
+my $sleeptime       = "600";          # sleep between command output collection    default 600 sec
+my $iterations      = "3";            # how often collect command output           default 3
+my $repeat          = "2400";         # repeat every 40 minutes, if $continous = 0 default 2400 sec
+my $continous       = "1";            # continously collect docs
+my $actlog          = "1";            # collect activity log
+my $summary         = "1";            # collect summary records
+my $timeout         = "300";          # timeout for procstack
+
+my $collectstmt     = "";             # available with 6.2.2 and newer servers, enabled via $sqlstats = "Y"
+my $statsinterval   = 30;             # interval length (sec) for iostat (UNIX only)
+
+# TSM commands to be run at intervals:
+my @commands = ("SHOW TIME",
+                "SHOW BANNER",
+                "SHOW RESQ",
+                "SHOW TXNT",
+                "QUERY MOUNT",
+                "Q SE F=D",
+                "SHOW SESS F=D");
+
+# TSM commands to be run at intervals if not STA:
+my $process_query = "\"select process_num as Number" . 
+                           ",process " . 
+                           ",current_timestamp as Current_Time " . 
+                           ",start_time " .
+                           ",(cast(files_processed as decimal(18,0))) as Files " . 
+                           ",(cast(bytes_processed as decimal(18,0)))/1024/1024 as MB " . 
+                           ",timestampdiff(2,char(current_timestamp-start_time)) as Elapsed_Time " . 
+                           ",(cast(files_processed as decimal(18,0))/timestampdiff(2,char(current_timestamp-start_time))) as Files_Second " . 
+                           ",(cast(bytes_processed as decimal(18,0))/1024/1024/timestampdiff(2,char(current_timestamp-start_time))) as MBytes_Second " .
+                           "from processes order by process_num desc\"";
+                           
+my @more_commands = ("Q DB F=D",
+                     "Q DBSPACE",
+                     "Q LOG F=D",
+                     "Q PROC",
+                     $process_query,
+                     "SHOW LOCKS",
+                     "SHOW DEDUPTHREAD");
+
+# DB2 commands to be run at intervals:
+my @db2commands = ("get snapshot for database on $dbalias",
+                   "list application show detail",
+                   "get snapshot for all applications",
+                   "\"select elapsed_time_sec, substr(activity_state,1,4) as state, substr( stmt_text, 1, 512) as stmt_text from sysibmadm.mon_current_sql where elapsed_time_sec > 1\"");
+
+
+# db2pd commands to be run at intervals:
+my @db2pdcommands = ("-db $dbalias -bufferpools -runstats -reorgs index -cleaner -wlocks -osinfo -dirtypages summary -mempools -dbcfg",
+                     "-dbptnmem",
+                     "-transactions -logs -db $dbalias");
+                     
+
+# initialize some variables
+my $noprompt        = "0";            # run in the foreground
+my $runmode         = "foreground";   # run in the foreground
+my $cyclesCompleted = "0";            # count completed diag collection cycles
+my $stopping        = "interrupted";  # used in stopScript if SIG(INT) received
+my $zipfiles        = "1";            # do you want to zip the docs collected?
+my $deldir          = "0";            # delete the target directory if zipfile is created...
+
+# Check for runmode
+if (defined $ARGV[0]) {
+  if ($ARGV[0] =~/noprompt/i) {
+     $noprompt = "1";
+     $runmode  = "background";
+  } else {
+     die "Usage: $0 <noprompt>\n";
+  }
+}
+
+# Check for Archive::Zip
+my $zipfiles = eval
+{
+  require Archive::Zip;
+  Archive::Zip->import();
+  1;
+};
+
+if (!$zipfiles) {
+      print "If you install Archive::Zip script can put the files collected into a zip archive. Install the Archive::Zip module using the cpan shell \"perl -MCPAN -e shell\", at the cpan shell specify \"install Archive::Zip\" to install the module from a CPAN mirror.\n\n";
+}
+
+# Check for File::Path
+eval {
+   require File::Path;
+   File::Path->import();
+   $deldir = 1 if $File::Path::VERSION >= 2.07;
+};
+
+if (!$deldir) {
+      print "If you install FilePath 2.07 or newer the script can clean up the temporary directory used for doc collection. Install the File::Path module using the cpan shell \"perl -MCPAN -e shell\", at the cpan shell specify \"install File::Path 2.07\" to install the module from a CPAN mirror.\n\n";
+}
+
+# Prompt the user for information
+print "This script will collect data in the $runmode until it's cancelled or the number of \$diagCycles is reached (if \$diagCycles <> -1)\n\n";
+print "This script starts TSM server instrumentation, when cancelling this script you may wish to stop server instrumentation via the TSM command 'instrument end' such that it doesn't continue to run indefinitely.\n\n";
+
+if (!$noprompt) {
+print "\nPress enter to accept default values shown in brackets:\n\n";
+   $server = getResp("Enter the servername as found in dsm.opt or dsm.sys",$server);
+   if (($^O eq "MSWin32") || ($^O eq "Windows_NT") || ($^O eq "cygwin")) {
+      $tcpport = getResp("Enter the tcpport",$tcpport);
+   }
+   $administrator = getResp("Enter the TSM administrator login ID",$administrator);
+   $password = getResp("Enter the TSM administrator password (warning, it will echo to the screen)",$password);
+   $pmr = getResp("Enter PMR number as PPPPP,BBB,CCC",$pmr);
+
+   if (!($^O eq "MSWin32") && !($^O eq "Windows_NT") && !($^O eq "cygwin")) {
+      while (!($showthreads eq "Y" || $showthreads eq "N")) {
+         if ($showthreads eq "") { $showthreads = "Y"; }
+         $showthreads = uc(getResp("Collect SHOW THREADS output? (Y/N)",$showthreads));
+      }
+   }
+
+   while (!($showdedupdelete eq "Y" || $showdedupdelete eq "N")) {
+      if ($showdedupdelete eq "") { $showdedupdelete = "Y"; }
+      $showdedupdelete = uc(getResp("Collect SHOW DEDUPDELETE output? (Y/N)",$showdedupdelete));
+   }
+
+
+   while (!($sqlstats eq "Y" || $sqlstats eq "N")) {
+      if ($sqlstats eq "") { $sqlstats = "N"; }
+      $sqlstats = uc(getResp("Enable collectstmt instrumentation? (N/Y)",$sqlstats));
+   }
+
+   while (!($dynamicsql eq "Y" || $dynamicsql eq "N")) {
+      if ($dynamicsql eq "") { $dynamicsql = "N"; }
+      $dynamicsql = uc(getResp("Enable SNAPSHOT FOR DYNAMIC SQL? (N/Y)",$dynamicsql));
+   }
+
+   $stopevent  = getResp("Enter comma separated stop events, e.g. ANR#####E",$stopevent);
+   $traceflags = getResp("Enter traceflags",$traceflags);
+   
+   if ( ($traceflags ne "") && (uc($traceflags) ne "NONE") ) {
+      $disableflags = getResp("Enter traceflags to disable",$disableflags);
+      my $done = 0;    
+      do {
+         $maxsize = max(getIntResp("Enter size limit for the tracefile. (1-65535MB, -1 unlimited)",$maxsize), -1);
+         if ( (($maxsize > 0) && ($maxsize < 65536)) || ($maxsize == -1) ) {
+            $done = 1;
+         }
+      } until $done;
+   }
+   
+   # the max() below will work fine with the default $diagCycles being -1
+   $diagCycles = max(getIntResp("Enter number for diagnostic cycles of " . ($iterations - 1) * $sleeptime . "s to run? (Indefinite if -1)",$diagCycles), $diagCycles);
+
+} else {
+   if ((!($^O eq "MSWin32") && !($^O eq "Windows_NT")) && (!($showthreads eq "Y" || $showthreads eq "N"))) {
+      die "\$showthreads must be either \"Y\" or \"N\"";
+   }
+   print "\nRunning with the following values configured in the script:\n";
+   print "Server       : $server\n";
+   if ($^O eq "MSWin32") {
+      print "tcpport      : $tcpport\n";
+   }
+   print "Administrator       : $administrator\n";
+   print "Password            : " . "*"x(length($password)) . "\n";
+   if ($ENV{"DB2INSTANCE"}) {
+      $instance = $ENV{"DB2INSTANCE"};
+   }
+   print "Instance            : $instance\n";
+   print "PMR                 : $pmr\n";
+   if (!($^O eq "MSWin32") && !($^O eq "Windows_NT")) { 
+      print "Collect SHOW THREADS: $showthreads\n";  
+   }
+   
+   print "Collect SHOW DEDUPDELETE: $showdedupdelete\n";  
+
+   if ( ($traceflags ne "") && (uc($traceflags) ne "NONE") ) {
+      print "Traceflags          : \"$traceflags\"\n";
+      print "Disable traceflags  : \"$disableflags\"\n";
+      print "Maxsize             : \"$maxsize\"\n";
+
+   }
+   
+   if ($diagCycles+0 ne $diagCycles) { 
+      print "Bad number for \$diagCycles\n"; exit;
+   } else {
+      print "Diag cycles         : $diagCycles\n";
+   }
+
+}
+
+# nothing to do if diagCycles is 0
+if ($diagCycles == 0) { 
+   print "Exiting as \$diagCycles is $diagCycles\n"; 
+   exit; 
+}
+
+if ($showdedupdelete eq "Y") {
+      push @more_commands, "SHOW DEDUPDELETE"; 
+}
+
+if ($dynamicsql eq "Y") {
+      push @db2commands, "get snapshot for dynamic sql on $dbalias"; 
+}
+
+my $statscmd = $vmstatcmd = $lparstatcmd = $lparstatcmdfinal = $pathdelimiter = ""; # set below, do not change here
+
+if (($^O eq "MSWin32") || ($^O eq "Windows_NT") || ($^O eq "cygwin")) {
+
+      push @commands, "SHOW THREADS"; 
+      
+      $pathdelimiter = ";";
+
+      $cmd = "dsmadmc -tcps=$server -tcpp=$tcpport -id=$administrator -pas=$password -scrollprompt=no";
+
+      if ( $ENV{'DSM_CONFIG'} eq "" ) {
+	 $dsm_opt = "c:\\progra~1\\tivoli\\tsm\\baclient\\dsm.opt";
+      } else {
+	 $dsm_opt = $ENV{'DSM_CONFIG'};
+      }
+
+      if ( $ENV{'DSM_DIR'} eq "" ) {
+         $tsmpath = "c:\\progra~1\\tivoli\\tsm\\baclient\\";
+      } else {
+         $tsmpath = $ENV{'DSM_DIR'};
+      }
+
+      $db2cmdpath = "C:\\Progra~1\\Tivoli\\TSM\\db2\\BIN\\";
+      $db2pdcmdpath = "C:\\Progra~1\\Tivoli\\TSM\\db2\\BIN\\";
+
+   } else {  #UNIX
+
+      $pathdelimiter = ":";
+
+      if ($showthreads eq "Y") {
+         push @commands, "SHOW THREADS"; 
+      }
+
+      $cmd = "dsmadmc -servername=$server -id=$administrator -pas=$password -scrollprompt=no";
+
+      if ($^O eq "aix") {
+
+         $fsclient = "/usr";
+         $fsserver = "/opt";
+	 if ( $ENV{'DSM_CONFIG'} eq "" ) {
+	     $dsm_opt = $fsclient . "/tivoli/tsm/client/ba/bin64/dsm.opt";
+	 } else {
+	     $dsm_opt = $ENV{'DSM_CONFIG'};
+	 }
+
+	 if ( $ENV{'DSM_DIR'} eq "" ) {
+             $tsmpath = $fsclient . "/tivoli/tsm/client/ba/bin64/";
+	 } else {
+	     $tsmpath = $ENV{'DSM_DIR'};
+	 }
+
+         $procstack = "/usr/bin/procstack";
+         $procrun = "/usr/bin/procrun";         
+	 $statsiterations = max(1, int( $iterations * $sleeptime / $statsinterval));
+	 $statscmd = "iostat -DlT $statsinterval $statsiterations";
+	 $vmstatcmd = "vmstat -Itw $statsinterval $statsiterations";
+	 $lparstatcmd = "lparstat $statsinterval $statsiterations";	 
+	 $lparstatcmdfinal = "lparstat -i";	 
+
+      } else {
+
+         $fsclient = "/opt";
+         $fsserver = "/opt";
+	 if ( $ENV{'DSM_CONFIG'} eq "" ) {
+	     $dsm_opt = $fsclient . "/tivoli/tsm/client/ba/bin/dsm.opt";
+	 } else {
+	     $dsm_opt = $ENV{'DSM_CONFIG'};
+	 }
+
+	 if ( $ENV{'DSM_DIR'} eq "" ) {
+             $tsmpath = $fsclient . "/tivoli/tsm/client/ba/bin/";
+	 } else {
+	     $tsmpath = $ENV{'DSM_DIR'};
+	 }
+
+         if (($^O eq "linux") || ($^O eq "solaris")) {
+	     if ( -x "/usr/bin/pstack" ) {
+		 $procstack = "/usr/bin/pstack";
+	     }
+	     if ( -x "/usr/bin/gstack" ) {
+		 $procstack = "/usr/bin/gstack";
+	     }
+         }
+	 $statsiterations = max(1, int( $iterations * $sleeptime / $statsinterval));
+	 if ($^O eq "linux") {
+	    if (-x "/usr/bin/iostat" ) {
+	       $statscmd = "/usr/bin/iostat -xtk $statsinterval $statsiterations";
+     }
+	    if (-x "/usr/bin/vmstat" ) {
+	       $vmstatcmd = "/usr/bin/vmstat $statsinterval $statsiterations";
+	    }    
+	 }
+	 if ($^O eq "solaris") {
+	    $statscmd = "iostat -xnT d $statsinterval $statsiterations";
+	    $vmstatcmd = "vmstat $statsinterval $statsiterations";
+	 }
+	 if ($^O eq "hpux") {
+	    $statscmd = "iostat -t $statsinterval $statsiterations";
+	    $vmstatcmd = "vmstat $statsinterval $statsiterations";	    
+	 }
+
+      }
+
+#     $dsm_opt = "~/dsm.opt";
+
+      $db2cmdpath = $fsserver . "/tivoli/tsm/db2/bin";
+      $db2pdcmdpath = $fsserver . "/tivoli/tsm/db2/adm";
+
+   }
+
+my @out;
+my $firstcycle = "true";
+my $serverpid = 0;
+my $traceactive = 0;
+my $instractive = 0;
+my $db2 = 0;
+my $stopquery = "";
+
+my $path = $ENV{'PATH'};
+$ENV{'PATH'} = $path . $pathdelimiter . $tsmpath . $pathdelimiter . $db2cmdpath . $pathdelimiter . $db2pdcmdpath;
+$ENV{'DSM_DIR'} = $tsmpath;
+$ENV{'DSM_CONFIG'} = $dsm_opt;
+
+if ( ($stopevent ne "") && (uc($stopevent) ne "NONE") ) {
+
+   $stopevent = uc($stopevent);
+   $stopevent =~ tr/ //ds;
+
+   if ($noprompt) {
+      print "Stop condition set  : \"" . $stopevent . "\".\n";
+   }
+
+   ($where = $stopevent) =~ tr/A-Za-z //ds;
+   $stopquery = "select message from actlog where originator='SERVER' and msgno in ( $where )";
+  
+}
+
+print "\nDSM_DIR: " . $tsmpath . "\nDSM_CONFIG: " . $dsm_opt . "\n\n";
+
+# enable commands if not in a STA environment
+# and prepare DB2 data collection
+if (!is_sta()) {
+
+   push(@commands, @more_commands);
+
+   if ( $ENV{'DB2INSTANCE'} eq "" ) {
+       $instance = getResp("Enter the DB2 instance name",$instance);
+       $ENV{'DB2INSTANCE'} = $instance;
+   }
+   
+   print "Collecting data for instance: " . $ENV{'DB2INSTANCE'} . "\n";
+
+   @out=`db2 connect to $dbalias`;
+   
+   $connectRC = $?;
+
+   print @out;
+
+   if (!$connectRC) { # connect went OK
+
+      $db2 = 1;   
+
+   } else {
+         
+      print "Error $connectRC connecting to $dbalias, DB information will not be collected.\n";
+      $db2 = 0;   
+   
+   }
+
+} else {
+
+  print "\nStorage agent environment\n";
+  $db2 = 0; 
+  $summary = 0;
+  
+}  
+
+$SIG{INT} = 'stopScript';  #set control-C routine
+print "\n";
+
+my $begindate   = strftime("%m/%d/%Y", localtime());
+my $begintime   = strftime("%H:%M:00", localtime());
+my $begints     = strftime("%Y-%m-%d %H:%M:%S.000000", localtime());
+my $now         = strftime("%Y%m%d-%H%M", localtime());
+my $actlogname  = "$now-00000000-actlog.txt";
+my $summaryname = "$now-00000000-summaryrec.csv";
+my $trccmdname  = "$now-00000000-trace-commands.txt";
+my $trcname     = "$now-00000000-trace.trc";
+
+my $targetdir = $showprefix = $prefix = "";
+
+if ( ($pmr ne "") && (uc($pmr) ne "NONE" ) )  {
+   $targetdir = $now . "-" . $pmr . "-" . $server . "-swg21432937-docu";
+} else {
+   $targetdir = $now . "-" . $server . "-swg21432937-docu";
+}
+
+my $startdir = getcwd();
+
+# create the target directory and cd to it
+prepareDocdir();
+
+
+# the main loop to collect docs
+while ($cyclesCompleted != $diagCycles)
+{
+
+   $now = strftime("%Y%m%d-%H%M", localtime());
+   my $begin = $now;
+   my $slept = 0;
+   my $stopcond = 0;
+
+   $prefix = "$now-" . sprintf("%08d", ++$cyclesCompleted);
+   
+   # print $showcycle;
+   # exit;
+
+
+   # get the server pid for procstack command
+   if ($serverpid == 0) {
+      $serverpid = &get_pid();
+   }
+   
+   if ($firstcycle eq "true") {
+
+      my $systemfile = "$now-00000000-system.txt";
+      my $configfile = "$now-00000000-config.txt";
+      my $volhfile   = "$now-00000000-volhistsize.txt";
+      
+      `$cmd  QUERY SYSTEM > $systemfile`;
+      print "-- Wrote $systemfile\n";
+
+      `$cmd  SHOW CONFIG > $configfile`;
+      print "-- Wrote $configfile\n";
+
+      `$cmd \"select count(*) as volumes_in_volhist from volhistory\" > $volhfile`;
+      print "-- Wrote $volhfile\n";
+
+
+      if ( ($traceflags ne "") && (uc($traceflags) ne "NONE") ) {
+         $traceactive = startTrace();
+      }
+
+      $firstcycle = "false";
+
+   }
+   
+   `$cmd instr begin $collectstmt`;
+   $instractive = 1;
+
+   if ( $statscmd ne "" ) {
+      system( "$statscmd > $prefix-iostat.txt &" );
+      print "Redirecting iostat to $prefix-iostat.txt\n";      
+   }
+
+   if ( $vmstatcmd ne "" ) {
+      system( "$vmstatcmd > $prefix-vmstat.txt &" );
+      print "Redirecting vmstat to $prefix-vmstat.txt\n";      
+   }
+   
+   if (($^O eq "aix") && ($lparstatcmd ne "")) {   
+      system( "$lparstatcmd > $prefix-lparstat.txt &" );
+      print "Redirecting lparstat to $prefix-lparstat.txt\n";      
+   }
+
+   $i = 0;
+   
+   $showprefix = "$now-" . sprintf("%08d", $cyclesCompleted);
+   $showoutfile = "$showprefix-show.txt";
+   # open (SHOWOUT, ">$showprefix-show.txt") || die "Can't open SHOWOUT for writing\n";
+
+   while ($i != $iterations) {
+
+      # first check if the stop condition is met
+      # we will honor the condition once show output is collected below;
+      
+      @out = `$cmd \"$stopquery and date_time >= \'$begints\'\"`;
+      
+      foreach $line ( @out ) {
+   
+         @conditions = split(/\,/,$stopevent); 
+      
+         foreach $condition (@conditions) {
+            if ($line =~ /^$condition/) {
+               ($condmsg = $line) =~ s/\s+$//;
+               $stopcond = 1;
+            }
+         } 
+      }
+
+
+      foreach $command (@commands) 
+      {
+         `$cmd  $command >> $showoutfile`;
+         # print SHOWOUT "@out\n\n";
+      }
+
+      if (defined $procstack) {
+         
+         if ($^O eq "aix") {
+
+            eval {
+	      local $SIG{ALRM} = sub { die "alarm\n" };
+	      alarm $timeout;
+              `$procstack $serverpid >> $showoutfile`;
+	      alarm 0;
+            };
+
+         } else {
+           
+           `$procstack $serverpid >> $showoutfile`;         
+         
+         }
+       
+         if ($@) {
+            die unless $@ eq "alarm\n";
+ 
+            if (defined $procrun) {
+               `$procrun $serverpid`;
+            }
+            
+            open (SHOWOUT, ">>$showoutfile") || die "Can't open $showoutfile for writing\n";
+            print SHOWOUT "\n\n $procstack $serverpid timed out after $timeout seconds.\n";
+            close (SHOWOUT);
+
+         } else {
+            # nothing to do here
+         }         
+         
+         if ($#out < 0) {
+            print "Reset of server pid\n";
+            $serverpid = 0;
+         }
+
+      }
+
+      # close(SHOWOUT);
+      print "-- Wrote $showoutfile\n";
+     
+      if ($stopcond) {
+         print "Stop condition detected: $condmsg\n";
+         $stopping ="stopping";
+         stopScript();    
+      }
+      
+      $i++;
+      
+      if ($i < $iterations) 
+      {
+
+        for($count=1; $count <= $sleeptime; $count++) { # to handle interrupt on Windows
+           sleep (1);
+        }
+
+        $slept += $sleeptime;
+        $now = strftime("%Y%m%d-%H%M", localtime());
+        $showprefix = "$now-" . sprintf("%08d", $cyclesCompleted);
+        $showoutfile = "$showprefix-show.txt";
+        # open (SHOWOUT, ">$showprefix-show.txt") || die "Can't open SHOWOUT for writing\n";
+      }
+   }
+
+   get_instrumentation("$prefix-instr.txt");
+
+   if ($db2) {
+      open (DB2OUT, ">$prefix-db2.txt") || die "Can't open DB2OUT for writing\n";   
+
+      foreach $db2command (@db2commands) 
+      {
+          @out=`db2 $db2command`;
+          print DB2OUT "COMMAND: db2 " . $db2command . "\n\n";
+          print DB2OUT "@out\n\n";
+      }
+
+      print "-- Wrote $prefix-db2.txt\n";
+      close(DB2OUT);
+   
+      open (DB2PDOUT, ">$prefix-db2pd.txt") || die "Can't open DB2OUT for writing\n";      
+
+      foreach $db2pdcommand (@db2pdcommands) 
+      {
+         @out=`db2pd $db2pdcommand`;
+         print DB2PDOUT "COMMAND: db2pd " . $db2pdcommand . "\n\n";
+         print DB2PDOUT "@out\n\n";
+      }
+      
+      print "-- Wrote $prefix-db2pd.txt\n";
+      close(DB2PDOUT);
+   }
+
+   if ($actlog || $summary) {
+      get_actlog_summary();
+   }
+      
+   $longsleep = $repeat - $slept;
+   if (!$continous) {
+
+      for ($count=1; $count <= $longsleep; $count++) { # to handle interrupt on Windows
+         sleep (1);
+      }
+
+   }
+
+   print "Completed " . $cyclesCompleted . " of $diagCycles doc collection cycles. "; 
+   
+   if ($diagCycles == -1) {
+      print "Stop the script via CTRL-C (SIGINT).";
+   }
+  
+   print "\n\n";
+   
+}
+
+$stopping ="stopping";
+stopScript();
+
+
+
+# Subroutines:
+
+# Get a user response and return it
+sub getResp
+{
+   local ($prompt,$default) = @_;
+
+   print "$prompt [$default]:";
+   $| = 1;
+   $_ = <STDIN>;
+   chomp;
+   return $_ ? $_ : $default;
+}
+
+# Get a numeric user response and return it
+sub getIntResp
+{
+   local ($prompt,$default) = @_;
+
+   print "$prompt [$default]:";
+
+   do { 
+
+      $return = 0;
+      $| = 1;
+      $_ = <STDIN>;
+      
+      chomp;
+
+      if ( m/[^0-9\-]/ ) { 
+         print "Bad number $_ - $prompt [$default]:"; 
+      } else {
+
+         if (length($_) == '0') {
+              return $default;
+         } else {
+              # reset to -1 if lower
+              return $_;
+         }
+      
+         $return = 1;
+      }
+
+   } until $return;
+
+}
+
+# Stop instrumentation and tracing  on the server
+# and do final doc completion tasks..
+sub stopScript
+{
+  
+   if ($instractive) {
+      print "\nScript $stopping, please wait while stopping instrumentation on the server..\n";
+      get_instrumentation("$now-99999999-lastinstr.txt");
+   } else { 
+      print "\nScript $stopping\n";
+   }
+   
+   if ($traceactive) {
+      print "\n.. stop active trace ..\n";
+      stopTrace();
+   }      
+
+   print "\n.. collecting transferstats ..\n";
+   open (POOLS,"$cmd select STGPOOL_NAME from stgpools |") || die "Can't open $cmd - $!";
+   $tansferstatsfile = "$now-transferstats.txt";
+
+   $i = 2;
+   while ($pool = <POOLS>) {
+
+     $pool =~ s/\s+$//; # remove trailing whitespaces
+
+     if ($pool =~ m/^ANS8002I/) {
+        print "-- Wrote $tansferstatsfile\n";
+        close (POOLS);
+     } elsif ( ($i > 13) && (length($pool)) ) {
+        print "-- [". $pool . "]\n"; 
+        @out=`$cmd SHOW TRANSFERSTATS $pool >> $tansferstatsfile`;
+
+     }
+
+     $i++;
+
+   }
+
+   if ($actlog || $summary) {
+      print "\n.. collecting actlog and/or summary information ..\n";
+      get_actlog_summary();
+   }
+   
+   if (($^O eq "aix") && ($lparstatcmdfinal ne "")) {   
+      print "\n.. collecting $lparstatcmdfinal ..\n";
+      `$lparstatcmdfinal > $now-99999999-lparstat.txt &`;
+      print "-- Wrote $now-99999999-lparstat.txt\n";      
+   }   
+   
+   print "\n.. doc preparation ..\n";
+   
+   if ($zipfiles) {
+      print "Creating zip archive $targetdir.zip\n";
+      my $zip = Archive::Zip->new();
+      $zip->addTree( '.' );
+
+      unless ( $zip->writeToFileNamed("$startdir/$targetdir.zip") == AZ_OK() ) {
+          $deldir = 0;
+          die 'Write error creating zipfile.\nAll docs collected are available under $startdir/$targetdir\n\n';        
+      }
+   
+      print "Documentation collection complete, please provide $startdir/$targetdir.zip.\n";
+
+   } else {
+
+      $deldir = 0;
+      print "Documentation collection complete, please provide the files collected under $startdir/$targetdir. You might later delete the directory to free up space.\n";
+
+   }
+
+   chdir($startdir);     
+
+   # try to remove the directory we used during doc collection, zipfile is available
+   if ($deldir) {
+
+      remove_tree( "$targetdir" );
+
+      if (-e "$targetdir") {
+         print "Failed to delete $targetdir in $startdir, please remove this yourself.\n";
+      } else {
+         print "Deleted temporary directory $targetdir.\n";
+      }
+      
+   }
+
+   print ".. and done.\n";   
+
+   exit(0);
+}
+
+sub get_pid() {
+
+  open(FILE,"$cmd  SHOW THREADS |") || die "Can't open $cmd - $!";
+
+  while (<FILE>) {
+  
+     print "$_";
+
+     if (m/^Server PID:/) {     # grab server pid from SHOW THREADS output
+        @fields = split(/\s+/,$_);         
+        close(FILE);
+        return $fields[2];
+     }
+
+     if (m/^  Server Version/) {     # check for server
+        @fields = split(/\s+/,$_);         
+        $version = $fields[3];
+        $version =~ s/\D+//g; 
+        $release = $fields[5];
+        $release =~ s/\D+//g; 
+        @lfields = split(/\./,$fields[7]);        
+        $level = $lfields[0];
+        $slevel = $lfields[1];
+ 
+        if ($sqlstats eq "Y") {
+           if (($version > 6) || (($version == 6) && ($release > 2)) || (($version == 6) && ($release = 2) && ($level >= 3)) ) {
+              $collectstmt = "collectstmt=true";
+              print "\n\"$collectstmt\" used for instrumentation statistics\n\n";
+           } else {
+              print "\nInstrumentation trace does not support COLLECTSTMT option at your server level\n\n";
+              undef($collectstmt);
+           }
+        } else {
+           undef($collectstmt);
+        }
+
+     }
+
+     if ((m/^ANS8023E/) || (m/^ANS1217E/) || (m/^ANS0101E/)) { # Failure contacting the server/message repository error
+        close(FILE);
+        exit;
+     }
+
+  }
+
+  close(FILE);
+  
+}
+
+sub get_actlog_summary() {
+
+   if ($actlog) {
+      `$cmd query actlog begindate=$begindate begintime=$begintime > $actlogname`;
+
+      if (-e "$actlogname") {
+         print "-- Wrote $actlogname\n";
+      } else {
+         print "$actlogname not written!\n";   
+      }
+   }
+
+   if ($summary) {
+      open (SUMMARY, ">$summaryname") || die "Can't open $summaryname for writing\n";
+
+      @out=`$cmd -tabd -dataonly=yes "select * from summary where start_time>=\'$begints\' or end_time>=\'$begints\'"`;
+      print SUMMARY "@out\n\n";
+      close(SUMMARY);
+      print "-- Wrote $summaryname\n";
+   }
+
+}
+
+sub get_instrumentation() {
+
+   $filename = "$_[0]";
+
+   if (traceActive()) {
+
+      open (INSTROUT, ">$filename") || exit;    
+      print INSTROUT "Warning, server trace is active, there may be high \"Unknown\" time in instrumentation due to this and performance in general may be severely degraded because of trace.\n";
+      print INSTROUT "The performance impact of trace can be lessened on version 6+ by using \"bufsize=4096\" on the trace begin command when a crash is not expected.\n\n";
+      close(INSTROUT);   
+
+   } 
+
+   `$cmd instr end > $filename`;
+   $instractive = 0;
+   print "-- Wrote $filename\n";
+
+}
+
+sub is_sta() {
+
+  my $connected =  0;
+  my $retries   = 10;
+  my $sleeptime = 60;
+  my $i         =  0;
+
+  # Verifying if we are in an STA environment is the first server
+  # connection attempt. We will retry and give up if we can't connect
+  # after a number of retries
+  
+  while ( !($connected) && ($i <= $retries) ) {
+  
+     if (!$i++) {
+        print "Connecting to server.\n"; 
+     }
+
+     open(FILE,"$cmd  QUERY DBSPACE |") || die "Can't open $cmd - $!";
+
+     while (<FILE>) {
+
+        if (m/^ANS8023E/) {
+           print $_;
+           print "Connect attempt " . $i . " failed";
+           if ($i <= $retries) {
+              print ": will try again in " . $sleeptime . "s. ($retries retries)";
+           } else {
+              print ".";         
+           }
+           print "\n";
+           sleep $sleeptime;
+        
+        } elsif ( (m/^ANS1217E/) || (m/^ANS0101E/) || (m/^ANS1035S/) || (m/^ANS1051I/) ) { # Failure during session initialisation
+           print $_;    
+           exit;
+        
+        } elsif (m/^ANR3604E/) { # This command is not supported in the current operating environment => STA
+           close(FILE);
+           return(1);
+        
+        } elsif (m/^---------/) {
+           $connected = 1;
+
+        } elsif (m/^ANS0102W/) { # Unable to open the message repository <REPOSITORY> The American English repository will be used instead.
+           print $_;
+
+        } elsif ( (m/^ANS8000I/) || (m/^ANS8002I/) )  {
+           print $_;    
+
+        } elsif (m/^ANS/) {      # some different message
+           print $_;    
+           exit;
+        }
+  
+     }
+     
+  }
+
+  if ($i < $retries) {
+     return(0);
+  } else {
+     print "Giving up connecting to server, please check the server is up and very the parameters are correct:\nservername: \"$server\"\n";
+     if (($^O eq "MSWin32") || ($^O eq "Windows_NT") || ($^O eq "cygwin")) {
+        print "tcpport   : \"$tcpport\"\n";
+     }
+     exit;
+  }
+
+}
+
+
+sub startTrace() {
+
+   if (traceActive()) {
+      print "Found active trace, tracing will not be activated.\n";
+      return 0;
+   }
+
+   open (TRCCMDSOUT, ">$trccmdname") || die "Can't open TRCCMDSOUT \"$trccmdname\" for writing\n";   
+
+   print "Reset traceflags.\n";
+   print TRCCMDSOUT `$cmd "trace dis *"`;
+   
+   @out = `$cmd "trace ena $traceflags"`;
+   print TRCCMDSOUT @out;
+
+   foreach $line (@out) {
+
+      if ($line =~ /^ANR0927E/) {
+         print $line;                             # throw message
+         close(TRCCMDSOUT);                         
+         return 0;
+      } 
+      
+   }
+
+   print "Enabled traceflag(s) $traceflags.\n";
+   
+   if ( ($disableflags ne "") && (uc($disableflags) ne "NONE") ) {
+      @out = `$cmd "trace dis $disableflags"`;
+      print TRCCMDSOUT @out;
+      print "Disabled traceflag(s) $disableflags.\n";
+   }
+   
+   
+   if ($maxsize > 0 ) {
+      $limitsize = "maxsize=$maxsize";
+   } else {
+      $limitsize = "";
+   }
+
+   if (($^O eq "MSWin32") || ($^O eq "Windows_NT") || ($^O eq "cygwin")) {
+      @out = `$cmd "trace begin \\"$rundir/$trcname\\" bufsize=4096 $limitsize"`;
+   } else {
+      @out = `$cmd "trace begin $rundir/$trcname bufsize=4096 $limitsize"`;
+   }
+
+   print TRCCMDSOUT @out;
+
+   foreach $line ( @out ) {
+
+      if ($line =~ /^ANR0921I/) {
+         print $line;                             # throw message
+         close(TRCCMDSOUT);
+         return 1;
+      } 
+      
+      if ($line =~ /^ANR0928E/) {
+         print $line;                             # throw message
+         print "Disabling current active traceflags again.\n";
+         print TRCCMDSOUT `$cmd "trace dis *"`;   # disable traceflags specified above
+         close(TRCCMDSOUT);
+         return 0;
+      }
+
+   }
+
+
+   close(TRCCMDSOUT);
+   return 0;                                      # should not get here...
+   
+}
+
+sub stopTrace() {
+
+   open (TRCCMDSOUT, ">>$trccmdname") || die "Can't open TRCCMDSOUT \"$trccmdname\" for writing\n";
+   
+   print TRCCMDSOUT `$cmd "trace end"`;
+   print TRCCMDSOUT `$cmd "trace flush"`;
+   print TRCCMDSOUT `$cmd "trace dis *"`;
+   
+   close (TRCCMDSOUT);
+
+}
+
+sub traceActive {
+
+   @out=`$cmd q trace`;
+   foreach $line ( @out ) {
+      if ( $line =~ / active/ ) {
+         return 1; 
+      }
+   }
+
+   return 0;
+
+}
+
+sub prepareDocdir() {
+
+   if (-d $targetdir) {
+      print "Target directory $targetdir exists, exiting";
+      exit;
+   } elsif (-f $targetdir) {
+      print "A file with the name of the target directory $targetdir exits, exiting";
+      exit;   
+   } else {
+      mkdir($targetdir) || die "Could not create $targetdir in $cwd";
+      chdir($targetdir);
+      $rundir = getcwd;
+      print "Created target directory $rundir, starting to collect docs.\n\n";
+      # create doc collection folders
+      mkdir("autopdzip");
+      chdir("autopdzip");
+      mkdir("autopd");
+      chdir("autopd");   
+      open (XMLOUT, "> autopd-collection-environment-v2.xml") || die "Can't open autopd-collection-environment-v2.xml for writing\n";
+      print XMLOUT "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n" . 
+      "<collectionEnvironmentInfo pluginTaxonomyId=\"SSGSG7\" toolName=\"" . $filename . "\" toolVersion=\"" . $version . "\"";
+      if ($instance ne "") {
+         print XMLOUT " DB2Instance=\"$instance\" ";
+      }
+      
+      my $login = "";
+      print XMLOUT " osName=\"$^O\" ";
+
+      if (($^O eq "MSWin32") || ($^O eq "Windows_NT")) {
+
+         my ( $osVername, $osMajor, $osMinor, $osId ) = Win32::GetOSVersion();
+         print XMLOUT "osVersion=\"$osVername\" osMajor=\"oaMajor\" osMinor=\"$osMinor\" osId=\"$osId\" ";
+         
+         $login = Win32::LoginName();
+      } else {
+         if ($^O eq "linux") {
+
+            @lsb_release = `lsb_release -d`;
+	    
+	    foreach (@lsb_release) {
+	      my($dummy, $description) = split(/:/);
+	      $description =~ s/^\s+//;
+	      $description =~ s/\s+$//;
+	      print XMLOUT "osDescription=\"$description\" ";
+	    }
+
+         } else {
+
+            @uname = `uname -a`;
+	    
+	    foreach $description (@uname) {
+	      $description =~ s/^\s+//;
+	      $description =~ s/\s+$//;
+	      print XMLOUT "unameInfo=\"$description\" ";
+	    }
+
+         
+         }
+
+         $login = getlogin || getpwuid($<) || "";
+      }
+      
+      if ($login ne "") {
+         print XMLOUT "userName=\"$login\" ";
+      }
+      
+      print XMLOUT "showthreads=\"$showthreads\" ";
+      print XMLOUT "showdedupdelete=\"$showdedupdelete\" ";
+      print XMLOUT "sqlstats=\"$sqlstats\" ";
+      print XMLOUT "dynamicsql=\"$dynamicsql\" ";
+      print XMLOUT "traceflags=\"$traceflags\" ";
+      print XMLOUT "disableflags=\"$disableflags\" ";
+      print XMLOUT "maxsize=\"$maxsize\" ";
+      print XMLOUT "stopevent=\"$stopevent\" ";
+      print XMLOUT "diagCycles=\"$diagCycles\" ";
+      print XMLOUT "dbalias=\"$dbalias\" ";
+      print XMLOUT "sleeptime=\"$sleeptime\" ";
+      print XMLOUT "iterations=\"$iterations\" ";
+      print XMLOUT "repeat=\"$repeat\" ";
+      
+      print XMLOUT "xmlns=\"http://www.ibm.com/autopd/collectionEnvironment\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://www.ibm.com/autopd/collectionEnvironment ../autoPD-collection-env.xsd\" />";
+      close(XMLOUT);
+      chdir($rundir);
+
+      return 1;
+   }
+
+}
+
+
+
